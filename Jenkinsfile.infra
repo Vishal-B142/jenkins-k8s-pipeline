@@ -1,0 +1,448 @@
+// =============================================================================
+// Infra Pipeline — monitoring namespace + headlamp namespace
+// Manages: Prometheus + Grafana + Loki + Promtail + Headlamp + Ingress rules
+//
+// Trigger: Manual ("Build Now") — not triggered on git push
+// Safe to run multiple times: helm upgrade --install is idempotent
+// =============================================================================
+
+pipeline {
+    agent any
+    tools {
+        jdk 'jdk21'
+    }
+    environment {
+        MONITORING_NAMESPACE = 'monitoring'
+        HEADLAMP_NAMESPACE   = 'headlamp'
+        APP_NAMESPACE        = 'app'
+        CERT_SECRET_SOURCE   = 'app-tls'   // TLS secret in app namespace to copy from
+    }
+    parameters {
+        booleanParam(
+            name: 'FORCE_REINSTALL',
+            defaultValue: false,
+            description: 'Delete all Helm releases and reinstall from scratch'
+        )
+        booleanParam(
+            name: 'SKIP_PROMETHEUS',
+            defaultValue: false,
+            description: 'Skip Prometheus + Grafana install/upgrade'
+        )
+        booleanParam(
+            name: 'SKIP_LOKI',
+            defaultValue: false,
+            description: 'Skip Loki install/upgrade'
+        )
+        booleanParam(
+            name: 'SKIP_PROMTAIL',
+            defaultValue: false,
+            description: 'Skip Promtail install/upgrade'
+        )
+        booleanParam(
+            name: 'SKIP_HEADLAMP',
+            defaultValue: false,
+            description: 'Skip Headlamp install/upgrade'
+        )
+        booleanParam(
+            name: 'REFRESH_TLS',
+            defaultValue: false,
+            description: 'Force refresh all TLS secrets — use after cert renewal'
+        )
+    }
+    stages {
+
+        /* =========================
+           CHECKOUT
+        ========================= */
+        stage('Checkout') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'github-credentials',
+                    usernameVariable: 'GIT_USER',
+                    passwordVariable: 'GIT_PASS'
+                )]) {
+                    sh """
+                        find . -mindepth 1 -delete || true
+                        git clone --no-single-branch \\
+                            https://\$GIT_USER:\$GIT_PASS@github.com/<YOUR_ORG>/<YOUR_REPO>.git .
+                        git checkout dev
+                    """
+                }
+            }
+        }
+
+        /* =========================
+           VERIFY TOOLS
+        ========================= */
+        stage('Verify Tools') {
+            steps {
+                withCredentials([
+                    file(credentialsId: 'k3s-kubeconfig', variable: 'KUBECONFIG_FILE')
+                ]) {
+                    sh """
+                        echo "=== kubectl version ==="
+                        kubectl --kubeconfig=\$KUBECONFIG_FILE version --client
+                        echo "=== helm version ==="
+                        helm version
+                        echo "=== Cluster Nodes ==="
+                        kubectl --kubeconfig=\$KUBECONFIG_FILE get nodes
+                        echo "=== Current Helm releases ==="
+                        helm list -n ${MONITORING_NAMESPACE} --kubeconfig=\$KUBECONFIG_FILE 2>/dev/null || echo "No releases yet"
+                        helm list -n ${HEADLAMP_NAMESPACE}   --kubeconfig=\$KUBECONFIG_FILE 2>/dev/null || echo "No releases yet"
+                    """
+                }
+            }
+        }
+
+        /* =========================
+           ADD HELM REPOS
+        ========================= */
+        stage('Add Helm Repos') {
+            steps {
+                sh """
+                    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
+                    helm repo add grafana https://grafana.github.io/helm-charts || true
+                    # NOTE: headlamp-k8s.github.io/headlamp/ returns 404 — using direct manifest
+                    helm repo update
+                    echo "Helm repos updated"
+                """
+            }
+        }
+
+        /* =========================
+           SETUP NAMESPACES + TLS
+        ========================= */
+        stage('Setup Namespaces + TLS') {
+            steps {
+                withCredentials([
+                    file(credentialsId: 'k3s-kubeconfig', variable: 'KUBECONFIG_FILE')
+                ]) {
+                    sh """
+                        # Create namespaces (idempotent)
+                        for NS in ${MONITORING_NAMESPACE} ${HEADLAMP_NAMESPACE}; do
+                            kubectl --kubeconfig=\$KUBECONFIG_FILE \\
+                                create namespace \$NS \\
+                                --dry-run=client -o yaml | \\
+                            kubectl --kubeconfig=\$KUBECONFIG_FILE apply -f -
+                            echo "Namespace ready: \$NS"
+                        done
+
+                        # Copy TLS secret from app namespace to monitoring + headlamp
+                        for NS in ${MONITORING_NAMESPACE} ${HEADLAMP_NAMESPACE}; do
+                            SECRET_NAME="app-tls-\$NS"
+                            EXISTS=\$(kubectl --kubeconfig=\$KUBECONFIG_FILE \\
+                                get secret \$SECRET_NAME -n \$NS \\
+                                --ignore-not-found \\
+                                -o jsonpath='{.metadata.name}' 2>/dev/null || echo "")
+
+                            if [ -n "\$EXISTS" ] && [ "${params.REFRESH_TLS}" = "false" ]; then
+                                echo "TLS secret \$SECRET_NAME already exists in \$NS — skipping"
+                            else
+                                echo "Creating TLS secret \$SECRET_NAME in \$NS..."
+                                CERT=\$(kubectl --kubeconfig=\$KUBECONFIG_FILE \\
+                                    get secret ${CERT_SECRET_SOURCE} -n ${APP_NAMESPACE} \\
+                                    -o jsonpath='{.data.tls\\.crt}' | base64 -d)
+                                KEY=\$(kubectl --kubeconfig=\$KUBECONFIG_FILE \\
+                                    get secret ${CERT_SECRET_SOURCE} -n ${APP_NAMESPACE} \\
+                                    -o jsonpath='{.data.tls\\.key}' | base64 -d)
+
+                                if [ -z "\$CERT" ] || [ -z "\$KEY" ]; then
+                                    echo "ERROR: Could not extract cert from ${CERT_SECRET_SOURCE} in ${APP_NAMESPACE}"
+                                    exit 1
+                                fi
+
+                                echo "\$CERT" > /tmp/infra-tls.crt
+                                echo "\$KEY"  > /tmp/infra-tls.key
+
+                                kubectl --kubeconfig=\$KUBECONFIG_FILE \\
+                                    delete secret \$SECRET_NAME -n \$NS --ignore-not-found
+                                kubectl --kubeconfig=\$KUBECONFIG_FILE \\
+                                    create secret tls \$SECRET_NAME \\
+                                    --cert=/tmp/infra-tls.crt \\
+                                    --key=/tmp/infra-tls.key \\
+                                    -n \$NS
+
+                                rm -f /tmp/infra-tls.crt /tmp/infra-tls.key
+                                echo "TLS secret \$SECRET_NAME created in \$NS"
+                            fi
+                        done
+                    """
+                }
+            }
+        }
+
+        /* =========================
+           FORCE REINSTALL (optional)
+        ========================= */
+        stage('Force Reinstall - Cleanup') {
+            when {
+                expression { params.FORCE_REINSTALL == true }
+            }
+            steps {
+                withCredentials([
+                    file(credentialsId: 'k3s-kubeconfig', variable: 'KUBECONFIG_FILE')
+                ]) {
+                    sh """
+                        echo "Force reinstall — removing existing Helm releases"
+                        for RELEASE in monitoring loki promtail; do
+                            helm uninstall \$RELEASE -n ${MONITORING_NAMESPACE} \\
+                                --kubeconfig=\$KUBECONFIG_FILE 2>/dev/null || echo "\$RELEASE not installed"
+                        done
+                        echo "Cleanup complete"
+                    """
+                }
+            }
+        }
+
+        /* =========================
+           PROMETHEUS + GRAFANA
+        ========================= */
+        stage('Prometheus + Grafana') {
+            when {
+                expression { params.SKIP_PROMETHEUS == false }
+            }
+            steps {
+                withCredentials([
+                    file(credentialsId: 'k3s-kubeconfig', variable: 'KUBECONFIG_FILE')
+                ]) {
+                    sh """
+                        echo "=== Installing/Upgrading Prometheus + Grafana ==="
+                        helm upgrade --install monitoring \\
+                            prometheus-community/kube-prometheus-stack \\
+                            -n ${MONITORING_NAMESPACE} \\
+                            -f monitoring/monitoring-values.yaml \\
+                            --kubeconfig=\$KUBECONFIG_FILE \\
+                            --timeout 20m \\
+                            --atomic=false
+                        # --atomic=false: avoids 15min timeout from --wait
+                        echo "Helm install submitted — checking pods..."
+                        kubectl --kubeconfig=\$KUBECONFIG_FILE get pods -n ${MONITORING_NAMESPACE}
+                    """
+                }
+            }
+        }
+
+        /* =========================
+           LOKI
+        ========================= */
+        stage('Loki') {
+            when {
+                expression { params.SKIP_LOKI == false }
+            }
+            steps {
+                withCredentials([
+                    file(credentialsId: 'k3s-kubeconfig', variable: 'KUBECONFIG_FILE')
+                ]) {
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        sh """
+                            echo "=== Installing/Upgrading Loki ==="
+                            helm upgrade --install loki \\
+                                grafana/loki \\
+                                -n ${MONITORING_NAMESPACE} \\
+                                -f monitoring/loki-values.yaml \\
+                                --kubeconfig=\$KUBECONFIG_FILE \\
+                                --timeout 10m \\
+                                --atomic=false
+                            echo "Loki install submitted"
+                            kubectl --kubeconfig=\$KUBECONFIG_FILE get pods -n ${MONITORING_NAMESPACE} \\
+                                -l "app.kubernetes.io/name=loki"
+                        """
+                    }
+                }
+            }
+        }
+
+        /* =========================
+           PROMTAIL
+        ========================= */
+        stage('Promtail') {
+            when {
+                expression { params.SKIP_PROMTAIL == false }
+            }
+            steps {
+                withCredentials([
+                    file(credentialsId: 'k3s-kubeconfig', variable: 'KUBECONFIG_FILE')
+                ]) {
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        sh """
+                            echo "=== Installing/Upgrading Promtail ==="
+                            helm upgrade --install promtail \\
+                                grafana/promtail \\
+                                -n ${MONITORING_NAMESPACE} \\
+                                -f monitoring/promtail-values.yaml \\
+                                --kubeconfig=\$KUBECONFIG_FILE \\
+                                --timeout 5m \\
+                                --atomic=false
+                            echo "Promtail install submitted"
+                            kubectl --kubeconfig=\$KUBECONFIG_FILE get pods -n ${MONITORING_NAMESPACE} \\
+                                -l "app.kubernetes.io/name=promtail"
+                        """
+                    }
+                }
+            }
+        }
+
+        /* =========================
+           HEADLAMP (direct manifest — Helm repo is 404)
+        ========================= */
+        stage('Headlamp') {
+            when {
+                expression { params.SKIP_HEADLAMP == false }
+            }
+            steps {
+                withCredentials([
+                    file(credentialsId: 'k3s-kubeconfig', variable: 'KUBECONFIG_FILE')
+                ]) {
+                    // catchError: Headlamp issues must NOT block Apply Infra Ingress stage
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                        sh """
+                            echo "=== Installing Headlamp via manifest ==="
+                            cat <<MANIFEST | kubectl --kubeconfig=\$KUBECONFIG_FILE apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: headlamp
+  namespace: ${HEADLAMP_NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: headlamp
+  template:
+    metadata:
+      labels:
+        app: headlamp
+    spec:
+      containers:
+      - name: headlamp
+        image: ghcr.io/headlamp-k8s/headlamp:latest
+        args:
+        - -in-cluster
+        - -plugins-dir=/headlamp/plugins
+        ports:
+        - containerPort: 4466
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+MANIFEST
+
+                            cat <<MANIFEST | kubectl --kubeconfig=\$KUBECONFIG_FILE apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: headlamp
+  namespace: ${HEADLAMP_NAMESPACE}
+spec:
+  selector:
+    app: headlamp
+  ports:
+  - port: 80
+    targetPort: 4466
+MANIFEST
+
+                            kubectl --kubeconfig=\$KUBECONFIG_FILE \\
+                                rollout status deployment/headlamp \\
+                                -n ${HEADLAMP_NAMESPACE} --timeout=120s
+
+                            # Create admin service account + cluster-admin binding
+                            kubectl --kubeconfig=\$KUBECONFIG_FILE \\
+                                create serviceaccount headlamp-admin \\
+                                -n ${HEADLAMP_NAMESPACE} \\
+                                --dry-run=client -o yaml | \\
+                            kubectl --kubeconfig=\$KUBECONFIG_FILE apply -f -
+
+                            kubectl --kubeconfig=\$KUBECONFIG_FILE \\
+                                create clusterrolebinding headlamp-admin \\
+                                --clusterrole=cluster-admin \\
+                                --serviceaccount=${HEADLAMP_NAMESPACE}:headlamp-admin \\
+                                --dry-run=client -o yaml | \\
+                            kubectl --kubeconfig=\$KUBECONFIG_FILE apply -f -
+
+                            echo "=== Headlamp Login Token (valid 1 year) — SAVE THIS ==="
+                            kubectl --kubeconfig=\$KUBECONFIG_FILE \\
+                                create token headlamp-admin \\
+                                -n ${HEADLAMP_NAMESPACE} \\
+                                --duration=8760h
+                            echo "=== End of token ==="
+                        """
+                    }
+                }
+            }
+        }
+
+        /* =========================
+           APPLY ALL INFRA INGRESS
+           Runs even if Headlamp stage failed (UNSTABLE)
+        ========================= */
+        stage('Apply Infra Ingress') {
+            when {
+                expression { currentBuild.result != 'ABORTED' }
+            }
+            steps {
+                withCredentials([
+                    file(credentialsId: 'k3s-kubeconfig', variable: 'KUBECONFIG_FILE')
+                ]) {
+                    sh """
+                        echo "=== Applying monitoring ingress ==="
+                        kubectl --kubeconfig=\$KUBECONFIG_FILE \\
+                            apply -f monitoring/monitoring-ingress.yaml \\
+                            --validate=false
+
+                        echo "=== Applying headlamp ingress ==="
+                        kubectl --kubeconfig=\$KUBECONFIG_FILE \\
+                            apply -f monitoring/headlamp-ingress.yaml \\
+                            --validate=false
+
+                        echo "=== All infra ingress rules ==="
+                        kubectl --kubeconfig=\$KUBECONFIG_FILE get ingress -n ${MONITORING_NAMESPACE}
+                        kubectl --kubeconfig=\$KUBECONFIG_FILE get ingress -n ${HEADLAMP_NAMESPACE}
+                    """
+                }
+            }
+        }
+
+        /* =========================
+           VERIFY FULL STACK
+        ========================= */
+        stage('Verify Stack') {
+            steps {
+                withCredentials([
+                    file(credentialsId: 'k3s-kubeconfig', variable: 'KUBECONFIG_FILE')
+                ]) {
+                    sh """
+                        echo "=== Pods - monitoring ==="
+                        kubectl --kubeconfig=\$KUBECONFIG_FILE get pods -n ${MONITORING_NAMESPACE}
+                        echo "=== Pods - headlamp ==="
+                        kubectl --kubeconfig=\$KUBECONFIG_FILE get pods -n ${HEADLAMP_NAMESPACE}
+                        echo "=== Helm releases ==="
+                        helm list -n ${MONITORING_NAMESPACE} --kubeconfig=\$KUBECONFIG_FILE
+                        echo "=== Ingress rules ==="
+                        kubectl --kubeconfig=\$KUBECONFIG_FILE get ingress -n ${MONITORING_NAMESPACE}
+                        kubectl --kubeconfig=\$KUBECONFIG_FILE get ingress -n ${HEADLAMP_NAMESPACE}
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Infra pipeline completed successfully"
+            echo "Grafana:  https://grafana.<YOUR_DOMAIN> (admin / changeme123)"
+            echo "Headlamp: https://headlamp.<YOUR_DOMAIN> (use token from Headlamp stage logs)"
+        }
+        failure {
+            echo "Infra pipeline failed — check logs above"
+            echo "Debug: kubectl get pods -n monitoring"
+            echo "Debug: kubectl get pods -n headlamp"
+            echo "Debug: kubectl get events -n monitoring --sort-by=.lastTimestamp"
+        }
+        always {
+            echo "Run 'helm list -n monitoring' and 'helm list -n headlamp' to check status"
+        }
+    }
+}
