@@ -1,0 +1,149 @@
+# =============================================================================
+# kube-prometheus-stack Helm values
+# Chart: prometheus-community/kube-prometheus-stack
+#
+# Key decisions:
+#   - persistence.enabled: false (emptyDir) — avoids PVC binding issues on k3s
+#   - Dashboards provisioned as code via dashboardProviders — survive pod restarts
+#   - Do NOT set isDefault: true on any datasource
+#     kube-prometheus-stack v82+ auto-provisions Prometheus as default internally
+#     Two defaults = Grafana CrashLoopBackOff
+#   - Loki URL must be loki-gateway.monitoring.svc.cluster.local (not loki:3100)
+#     Loki chart v6+ deploys a gateway proxy — direct port 3100 no longer works
+#   - On EKS: re-enable persistence with storageClassName: gp2
+# =============================================================================
+
+# -- Grafana -------------------------------------------------------------------
+grafana:
+  enabled: true
+
+  adminPassword: "changeme123"   # CHANGE THIS immediately after first login
+
+  service:
+    type: ClusterIP
+    port: 80
+
+  # Persistence disabled — fixes PVC binding issue on k3s local-path provisioner
+  # Dashboards and datasources configured via values so nothing is lost on restart
+  # On EKS: set enabled: true, storageClassName: gp2, size: 5Gi
+  persistence:
+    enabled: false
+
+  # Pre-configure datasources automatically on every pod start
+  # Do NOT set isDefault: true — chart v82+ handles Prometheus default internally
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://monitoring-kube-prometheus-prometheus:9090
+          access: proxy
+          # isDefault: true   <-- DO NOT SET — causes CrashLoopBackOff
+        - name: Loki
+          type: loki
+          # Use loki-gateway (nginx proxy) — NOT loki:3100
+          url: http://loki-gateway.monitoring.svc.cluster.local
+          access: proxy
+
+  # Pre-load dashboards from Grafana.com — recreated on every pod start
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: default
+          orgId: 1
+          folder: Dashboards
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+
+  dashboards:
+    default:
+      kubernetes-cluster:
+        gnetId: 7249
+        revision: 1
+        datasource: Prometheus
+      node-exporter:
+        gnetId: 1860
+        revision: 37
+        datasource: Prometheus
+      kubernetes-pods:
+        gnetId: 6336
+        revision: 1
+        datasource: Prometheus
+      loki-logs:
+        gnetId: 13639
+        revision: 2
+        datasource: Loki
+
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "300m"
+
+  grafana.ini:
+    server:
+      root_url: https://grafana.<YOUR_DOMAIN>
+    security:
+      allow_embedding: true
+    auth.anonymous:
+      enabled: false
+
+# -- Prometheus ----------------------------------------------------------------
+prometheus:
+  enabled: true
+  prometheusSpec:
+    retention: 15d
+    retentionSize: "10GB"
+
+    # emptyDir — avoids PVC binding issues on k3s single-node
+    # On EKS: replace with storageSpec using EBS gp2
+    storageSpec: {}
+
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "200m"
+      limits:
+        memory: "2Gi"
+        cpu: "1000m"
+
+# -- Alertmanager --------------------------------------------------------------
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "50m"
+      limits:
+        memory: "256Mi"
+        cpu: "200m"
+
+# -- Node Exporter (VPS hardware metrics) -------------------------------------
+nodeExporter:
+  enabled: true
+
+# -- kube-state-metrics (K8s object metrics — HPA targets, pod counts) --------
+kubeStateMetrics:
+  enabled: true
+
+# -- Disable components not available on single-node k3s ----------------------
+# Re-enable on multi-node EKS
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
