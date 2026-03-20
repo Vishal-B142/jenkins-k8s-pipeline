@@ -1,0 +1,31 @@
+# =============================================================================
+# Traefik Ingress for Grafana
+# Namespace: monitoring
+# Apply: kubectl apply -f monitoring/monitoring-ingress.yaml --validate=false
+# --validate=false: remote kubectl lacks Traefik CRD schemas
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: monitoring
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.middlewares: app-redirect-https@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - grafana.<YOUR_DOMAIN>
+      secretName: app-tls-monitoring
+  rules:
+    - host: grafana.<YOUR_DOMAIN>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: monitoring-grafana
+                port:
+                  number: 80

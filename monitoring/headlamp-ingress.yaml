@@ -1,0 +1,30 @@
+# =============================================================================
+# Traefik Ingress for Headlamp K8s dashboard
+# Namespace: headlamp
+# Apply: kubectl apply -f monitoring/headlamp-ingress.yaml --validate=false
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: headlamp
+  namespace: headlamp
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.middlewares: app-redirect-https@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - headlamp.<YOUR_DOMAIN>
+      secretName: app-tls-headlamp
+  rules:
+    - host: headlamp.<YOUR_DOMAIN>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: headlamp
+                port:
+                  number: 80

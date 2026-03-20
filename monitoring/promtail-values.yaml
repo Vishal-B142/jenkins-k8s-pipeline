@@ -1,0 +1,72 @@
+# =============================================================================
+# Promtail Helm values
+# Chart: grafana/promtail
+#
+# Ships pod logs from every node to Loki gateway
+# Runs as DaemonSet — one pod per node (important for multi-node EKS)
+# On EKS: replace Promtail with Fluent Bit (AWS-recommended log shipper)
+# =============================================================================
+
+config:
+  clients:
+    # Use loki-gateway — NOT loki:3100
+    # Loki chart v6+ deploys a gateway (nginx proxy) in front of Loki
+    - url: http://loki-gateway.monitoring.svc.cluster.local/loki/api/v1/push
+
+  snippets:
+    pipelineStages:
+      - cri: {}
+
+    scrapeConfigs: |
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # Add standard k8s labels to every log stream
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            target_label: container
+          # Capture blue/green slot label — useful for filtering deploys
+          - source_labels: [__meta_kubernetes_pod_label_slot]
+            target_label: slot
+          # Set log file path from pod UID and container name
+          - replacement: /var/log/pods/*$1/*.log
+            separator: /
+            source_labels:
+              - __meta_kubernetes_pod_uid
+              - __meta_kubernetes_pod_container_name
+            target_label: __path__
+
+# Run as DaemonSet so every node ships logs
+daemonset:
+  enabled: true
+
+resources:
+  requests:
+    memory: "64Mi"
+    cpu: "50m"
+  limits:
+    memory: "256Mi"
+    cpu: "200m"
+
+# Mount host log paths
+volumes:
+  - name: pods-logs
+    hostPath:
+      path: /var/log/pods
+  - name: docker-logs
+    hostPath:
+      path: /var/lib/docker/containers
+
+volumeMounts:
+  - name: pods-logs
+    mountPath: /var/log/pods
+    readOnly: true
+  - name: docker-logs
+    mountPath: /var/lib/docker/containers
+    readOnly: true

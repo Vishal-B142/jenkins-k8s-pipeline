@@ -1,0 +1,99 @@
+# =============================================================================
+# Loki Helm values
+# Chart: grafana/loki v6.x
+#
+# Key decisions:
+#   - SingleBinary mode — one pod handles all Loki roles
+#   - schemaConfig required — Loki chart v6+ will fail without it
+#   - persistence.enabled: false BUT emptyDir mounted at /var/loki
+#     Loki writes to /var/loki even when persistence is disabled
+#     Without emptyDir: CrashLoopBackOff (read-only filesystem)
+#   - chunksCache + resultsCache disabled — not needed for single node
+#   - backend/read/write replicas set to 0 — we use SingleBinary not microservices
+#   - On EKS: switch storage.type to s3, add S3 bucket config + IRSA
+# =============================================================================
+
+deploymentMode: SingleBinary
+
+loki:
+  auth_enabled: false
+
+  commonConfig:
+    replication_factor: 1
+
+  # Storage config — filesystem backend via emptyDir
+  # On EKS: change type to s3 and add s3 bucketNames config
+  storage:
+    type: filesystem
+
+  # Required in Loki chart v6+ — will fail to start without this block
+  schemaConfig:
+    configs:
+      - from: "2024-01-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h
+
+  # Storage paths — point to emptyDir mount at /var/loki
+  storage_config:
+    tsdb_shipper:
+      active_index_directory: /var/loki/index
+      cache_location: /var/loki/index_cache
+    filesystem:
+      directory: /var/loki/chunks
+
+  # Ruler storage
+  rulerConfig:
+    storage:
+      type: local
+      local:
+        directory: /var/loki/rules
+
+  limits_config:
+    retention_period: 720h        # 30 days
+    ingestion_rate_mb: 16
+    ingestion_burst_size_mb: 32
+    max_streams_per_user: 10000
+
+singleBinary:
+  replicas: 1
+
+  # Disable PVC — use emptyDir instead
+  persistence:
+    enabled: false
+
+  # Mount emptyDir at /var/loki so Loki can write to it
+  # Without this: CrashLoopBackOff (mkdir /var/loki: read-only file system)
+  extraVolumes:
+    - name: loki-data
+      emptyDir: {}
+  extraVolumeMounts:
+    - name: loki-data
+      mountPath: /var/loki
+
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+# Disable cache components — not needed for single node
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+
+# Disable microservice replicas — SingleBinary mode handles everything
+backend:
+  replicas: 0
+read:
+  replicas: 0
+write:
+  replicas: 0
+ingester:
+  replicas: 0
