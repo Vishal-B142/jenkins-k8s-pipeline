@@ -1,0 +1,145 @@
+# =============================================================================
+# Blue/Green Deployment pairs
+# Each service has two Deployments: -blue (active) and -green (idle)
+# Jenkins pipeline handles the slot switch — do not edit slot labels manually
+#
+# Apply: kubectl apply -f k3s/deployments.yaml
+# =============================================================================
+
+# =============================================================================
+# Example: gateway-service
+# Copy this block for each service — update name, image, port, env
+# =============================================================================
+
+# --- BLUE (active on first deploy) ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-service-blue
+  namespace: app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway-service
+      slot: blue
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: gateway-service
+        slot: blue
+    spec:
+      imagePullSecrets:
+        - name: ecr-secret
+      containers:
+        - name: gateway-service
+          image: <ACCOUNT_ID>.dkr.ecr.ap-south-1.amazonaws.com/app:gateway-service
+          ports:
+            - containerPort: 8007
+          envFrom:
+            - secretRef:
+                name: gateway-service-env
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8007
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8007
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+# --- GREEN (idle on first deploy) ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-service-green
+  namespace: app
+spec:
+  replicas: 0     # Always starts at 0 — Jenkins scales up on deploy
+  selector:
+    matchLabels:
+      app: gateway-service
+      slot: green
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: gateway-service
+        slot: green
+    spec:
+      imagePullSecrets:
+        - name: ecr-secret
+      containers:
+        - name: gateway-service
+          image: <ACCOUNT_ID>.dkr.ecr.ap-south-1.amazonaws.com/app:gateway-service
+          ports:
+            - containerPort: 8007
+          envFrom:
+            - secretRef:
+                name: gateway-service-env
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8007
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8007
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+# --- Service (selector is patched by Jenkins on every deploy) ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-service
+  namespace: app
+  annotations:
+    active-slot: "blue"    # Jenkins reads and updates this annotation
+spec:
+  selector:
+    app: gateway-service
+    slot: blue             # Jenkins patches this to green/blue on deploy
+  ports:
+    - port: 8007
+      targetPort: 8007
+
+# =============================================================================
+# Repeat the blue/green Deployment + Service pattern above for each service.
+# Only the following fields change per service:
+#   - metadata.name (service-name-blue / service-name-green)
+#   - spec.selector.matchLabels.app
+#   - spec.template.metadata.labels.app
+#   - image
+#   - containerPort / service port
+#   - envFrom secretRef name
+# =============================================================================
