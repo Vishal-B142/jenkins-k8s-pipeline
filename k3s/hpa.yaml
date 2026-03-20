@@ -1,0 +1,96 @@
+# =============================================================================
+# HorizontalPodAutoscaler — all services
+# Apply: kubectl apply -f k3s/hpa.yaml
+#
+# Public-facing services: CPU 60%, Memory 75%, scaleUp 30s
+# Internal services:      CPU 70%, Memory 80%, scaleUp 60s
+# All services: min=1, max=5, scaleDown stabilization 300s
+#
+# NOTE: HPA targets the -blue deployment by name.
+# After a blue/green slot switch the service selector changes,
+# but HPA continues tracking the named Deployment correctly.
+# =============================================================================
+
+# Public-facing service example (gateway, ai, portals)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway-service
+  namespace: app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gateway-service-blue
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+---
+# Internal service example (auth, notifications, payments, workers)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: auth-service
+  namespace: app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: auth-service-blue
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+---
+# Add one HPA block per service following the same pattern above.
+# Public-facing (CPU 60 / Mem 75 / scaleUp 30s): gateway, ai, portals
+# Internal      (CPU 70 / Mem 80 / scaleUp 60s):  auth, notification, payment, workers

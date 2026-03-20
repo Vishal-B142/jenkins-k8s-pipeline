@@ -1,0 +1,156 @@
+# =============================================================================
+# Traefik Ingress Configuration
+# Replaces: nginx Deployment with hostNetwork: true
+# Apply: kubectl apply -f k3s/ingress.yaml --validate=false
+#
+# --validate=false required: remote kubectl lacks Traefik CRD schemas
+# The cluster itself validates correctly
+#
+# IMPORTANT: Use plain ASCII only in this file
+# Unicode characters (arrows, emoji) cause: cannot unmarshal string into Go value
+# =============================================================================
+
+# Middleware: HTTP -> HTTPS redirect (replaces nginx return 301)
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-https
+  namespace: app
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+# Middleware: Strip /api prefix
+# Replaces nginx: rewrite ^/api/?(.*)$ /$1 break
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: strip-api-prefix
+  namespace: app
+spec:
+  stripPrefix:
+    prefixes:
+      - /api
+---
+# =============================================================================
+# Ingress: ai.<YOUR_DOMAIN> -> ai-service:8003
+# WebSocket enabled (Upgrade/Connection headers handled by Traefik natively)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-service
+  namespace: app
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.middlewares: app-redirect-https@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - ai.<YOUR_DOMAIN>
+      secretName: app-tls
+  rules:
+    - host: ai.<YOUR_DOMAIN>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ai-service
+                port:
+                  number: 8003
+---
+# =============================================================================
+# Ingress: api.<YOUR_DOMAIN> -> gateway-service:8007
+# WebSocket + long timeouts (SSE/streaming)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gateway-api
+  namespace: app
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.middlewares: app-redirect-https@kubernetescrd
+    # Match nginx proxy_read_timeout 3600s for streaming/SSE responses
+    traefik.ingress.kubernetes.io/service.responseforwarding.flushinterval: "100ms"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - api.<YOUR_DOMAIN>
+      secretName: app-tls
+  rules:
+    - host: api.<YOUR_DOMAIN>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway-service
+                port:
+                  number: 8007
+---
+# =============================================================================
+# Ingress: app.<YOUR_DOMAIN> -> app-portal:8002
+# /api/* -> gateway-service:8007 (strip /api prefix)
+# / -> app-portal:8002
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-portal
+  namespace: app
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.middlewares: app-redirect-https@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - app.<YOUR_DOMAIN>
+      secretName: app-tls
+  rules:
+    - host: app.<YOUR_DOMAIN>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app-portal
+                port:
+                  number: 8002
+---
+# app /api/* -> gateway-service (separate Ingress for per-path middleware)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-gateway-api
+  namespace: app
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.middlewares: app-redirect-https@kubernetescrd,app-strip-api-prefix@kubernetescrd
+    # Higher priority so /api/* matches before / catch-all
+    traefik.ingress.kubernetes.io/router.priority: "10"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - app.<YOUR_DOMAIN>
+      secretName: app-tls
+  rules:
+    - host: app.<YOUR_DOMAIN>
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway-service
+                port:
+                  number: 8007
